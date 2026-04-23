@@ -226,10 +226,14 @@ export default function RealtimeRoom() {
     async function startNats() {
       try {
         setNatsStatus("connecting");
+        setError(null);
 
         localConnection = await connect({
           servers: NATS_URL,
           name: `${name.trim()}-browser-chat`,
+          reconnect: true,
+          maxReconnectAttempts: 10,
+          reconnectTimeWait: 1000,
         });
 
         if (cancelled) {
@@ -263,21 +267,28 @@ export default function RealtimeRoom() {
           }
         })();
 
-        localConnection.closed().then(() => {
+        localConnection.closed().then((err) => {
           if (!cancelled) {
             setNatsStatus("disconnected");
+            if (err) {
+              const message =
+                err instanceof Error ? err.message : JSON.stringify(err);
+              setError(`NATS disconnected: ${message}`);
+            }
           }
         });
       } catch (err) {
         console.error("NATS connection error:", err);
         if (!cancelled) {
           setNatsStatus("error");
-          setError("Could not connect to NATS. Check NEXT_PUBLIC_NATS_URL.");
+          const message =
+            err instanceof Error ? err.message : JSON.stringify(err);
+          setError(`NATS connect failed: ${message}`);
         }
       }
     }
 
-    startNats();
+    void startNats();
 
     return () => {
       cancelled = true;
@@ -313,7 +324,9 @@ export default function RealtimeRoom() {
       setDraft("");
     } catch (err) {
       console.error("Publish failed:", err);
-      setError("Failed to send message.");
+      const message =
+        err instanceof Error ? err.message : JSON.stringify(err);
+      setError(`Failed to send message: ${message}`);
     }
   }, [draft, name, sc]);
 
@@ -418,6 +431,8 @@ export default function RealtimeRoom() {
                       ? "bg-emerald-400"
                       : natsStatus === "connecting"
                       ? "bg-amber-400"
+                      : natsStatus === "error"
+                      ? "bg-red-400"
                       : "bg-zinc-500"
                   }`}
                 />
