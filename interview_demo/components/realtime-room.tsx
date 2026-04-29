@@ -20,6 +20,12 @@ type ChatMessage = {
   ts: number;
 };
 
+type RingEvent = {
+  id: string;
+  from: string;
+  ts: number;
+};
+
 const ROOM_NAME =
   process.env.NEXT_PUBLIC_ROOM_NAME?.trim() || "dr-gopi-demo-room";
 const LIVEKIT_URL = process.env.NEXT_PUBLIC_LIVEKIT_URL?.trim() || "";
@@ -70,7 +76,11 @@ function ParticipantVideoGrid() {
   );
 }
 
-function OnlineUsersPanel() {
+function OnlineUsersPanel({
+  onRingUser,
+}: {
+  onRingUser: (targetUser: string) => void;
+}) {
   const participants = useParticipants();
 
   return (
@@ -89,7 +99,7 @@ function OnlineUsersPanel() {
           </div>
         ) : (
           participants.map((participant) => {
-            const name =
+            const participantName =
               participant.name || participant.identity || "Participant";
 
             return (
@@ -99,11 +109,21 @@ function OnlineUsersPanel() {
               >
                 <div className="flex items-center gap-2">
                   <span className="h-2.5 w-2.5 rounded-full bg-emerald-400" />
-                  <span className="text-sm text-zinc-200">{name}</span>
+                  <span className="text-sm text-zinc-200">
+                    {participantName}
+                  </span>
                 </div>
-                <span className="text-xs text-zinc-500">
-                  {participant.isLocal ? "You" : "Live"}
-                </span>
+
+                {participant.isLocal ? (
+                  <span className="text-xs text-zinc-500">You</span>
+                ) : (
+                  <button
+                    onClick={() => onRingUser(participantName)}
+                    className="rounded-full border border-amber-500/40 bg-amber-500/15 px-3 py-1 text-xs font-medium text-amber-200 transition hover:bg-amber-500/25"
+                  >
+                    Ring
+                  </button>
+                )}
               </div>
             );
           })
@@ -113,11 +133,7 @@ function OnlineUsersPanel() {
   );
 }
 
-function RoomControls({
-  onLeave,
-}: {
-  onLeave: () => void;
-}) {
+function RoomControls({ onLeave }: { onLeave: () => void }) {
   return (
     <div className="mt-4 flex flex-wrap items-center gap-3">
       <TrackToggle
@@ -153,6 +169,7 @@ export default function RealtimeRoom() {
   const [name, setName] = useState("");
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [incomingRing, setIncomingRing] = useState<RingEvent | null>(null);
   const [livekitToken, setLivekitToken] = useState<string | null>(null);
   const [shouldConnectRoom, setShouldConnectRoom] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
@@ -162,12 +179,55 @@ export default function RealtimeRoom() {
   >("idle");
 
   const ncRef = useRef<NatsConnection | null>(null);
+  const lastRingSentRef = useRef(0);
   const sc = useMemo(() => StringCodec(), []);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  const playRingSound = useCallback(() => {
+    try {
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as typeof window & { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext;
+
+      if (!AudioContextClass) return;
+
+      const audioContext = new AudioContextClass();
+
+      const playBeep = (delay: number) => {
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+
+        oscillator.type = "sine";
+        oscillator.frequency.value = 880;
+
+        oscillator.connect(gain);
+        gain.connect(audioContext.destination);
+
+        const startTime = audioContext.currentTime + delay;
+        gain.gain.setValueAtTime(0.0001, startTime);
+        gain.gain.exponentialRampToValueAtTime(0.25, startTime + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startTime + 0.35);
+
+        oscillator.start(startTime);
+        oscillator.stop(startTime + 0.4);
+      };
+
+      playBeep(0);
+      playBeep(0.55);
+      playBeep(1.1);
+
+      window.setTimeout(() => {
+        void audioContext.close().catch(() => {});
+      }, 1800);
+    } catch {
+      // Browser may block audio until user interacts with page.
+    }
+  }, []);
 
   const joinRoom = useCallback(async () => {
     if (!name.trim()) {
@@ -222,6 +282,7 @@ export default function RealtimeRoom() {
 
     let cancelled = false;
     let localConnection: NatsConnection | null = null;
+    const currentUser = name.trim();
 
     async function startNats() {
       try {
@@ -230,10 +291,11 @@ export default function RealtimeRoom() {
 
         localConnection = await connect({
           servers: NATS_URL,
-          name: `${name.trim()}-browser-chat`,
+          name: `${currentUser}-browser-chat`,
           reconnect: true,
           maxReconnectAttempts: 10,
           reconnectTimeWait: 1000,
+          ignoreServerUpdates: true,
         });
 
         if (cancelled) {
@@ -244,11 +306,14 @@ export default function RealtimeRoom() {
         ncRef.current = localConnection;
         setNatsStatus("connected");
 
-        const sub = localConnection.subscribe(`room.${ROOM_NAME}.chat`);
+        const chatSub = localConnection.subscribe(`room.${ROOM_NAME}.chat`);
+        const ringSub = localConnection.subscribe(
+          `room.${ROOM_NAME}.ring.${currentUser}`
+        );
 
         (async () => {
           try {
-            for await (const msg of sub) {
+            for await (const msg of chatSub) {
               const raw = sc.decode(msg.data);
 
               try {
@@ -260,6 +325,33 @@ export default function RealtimeRoom() {
                 });
               } catch {
                 // Ignore malformed messages
+              }
+            }
+          } catch {
+            // subscription closed
+          }
+        })();
+
+        (async () => {
+          try {
+            for await (const msg of ringSub) {
+              const raw = sc.decode(msg.data);
+
+              try {
+                const parsed = JSON.parse(raw) as RingEvent;
+
+                if (parsed.from === currentUser) return;
+
+                setIncomingRing(parsed);
+                playRingSound();
+
+                window.setTimeout(() => {
+                  setIncomingRing((current) =>
+                    current?.id === parsed.id ? null : current
+                  );
+                }, 5000);
+              } catch {
+                // Ignore malformed ring events
               }
             }
           } catch {
@@ -303,7 +395,7 @@ export default function RealtimeRoom() {
         });
       }
     };
-  }, [shouldConnectRoom, name, sc]);
+  }, [shouldConnectRoom, name, sc, playRingSound]);
 
   const sendMessage = useCallback(async () => {
     const text = draft.trim();
@@ -330,6 +422,41 @@ export default function RealtimeRoom() {
     }
   }, [draft, name, sc]);
 
+  const sendRing = useCallback(
+    (targetUser: string) => {
+      const sender = name.trim();
+      const target = targetUser.trim();
+      const nc = ncRef.current;
+
+      if (!sender || !target || !nc) return;
+      if (target === sender) return;
+
+      const now = Date.now();
+
+      if (now - lastRingSentRef.current < 1500) return;
+      lastRingSentRef.current = now;
+
+      const payload: RingEvent = {
+        id: `${now}-${Math.random().toString(36).slice(2, 10)}`,
+        from: sender,
+        ts: now,
+      };
+
+      try {
+        nc.publish(
+          `room.${ROOM_NAME}.ring.${target}`,
+          sc.encode(JSON.stringify(payload))
+        );
+      } catch (err) {
+        console.error("Ring publish failed:", err);
+        const message =
+          err instanceof Error ? err.message : JSON.stringify(err);
+        setError(`Failed to ring: ${message}`);
+      }
+    },
+    [name, sc]
+  );
+
   const leaveRoom = useCallback(() => {
     const current = ncRef.current;
     ncRef.current = null;
@@ -344,6 +471,7 @@ export default function RealtimeRoom() {
     setLivekitToken(null);
     setMessages([]);
     setDraft("");
+    setIncomingRing(null);
     setNatsStatus("idle");
     setError(null);
   }, []);
@@ -372,6 +500,15 @@ export default function RealtimeRoom() {
           Instant room chat over NATS and live audio/video over LiveKit in one page.
         </p>
       </div>
+
+      {incomingRing ? (
+        <div className="fixed right-5 top-5 z-50 rounded-3xl border border-amber-400/40 bg-amber-500/20 px-5 py-4 text-amber-100 shadow-2xl shadow-black/40 backdrop-blur">
+          <div className="text-sm font-semibold">🔔 Incoming ring</div>
+          <div className="mt-1 text-xs text-amber-100/80">
+            {incomingRing.from} is ringing you
+          </div>
+        </div>
+      ) : null}
 
       {!shouldConnectRoom ? (
         <div className="mx-auto mt-10 w-full max-w-xl rounded-[28px] border border-zinc-800 bg-zinc-900/70 p-6 shadow-2xl shadow-black/30">
@@ -446,7 +583,7 @@ export default function RealtimeRoom() {
           </section>
 
           <aside className="grid grid-cols-1 gap-6">
-            <OnlineUsersPanel />
+            <OnlineUsersPanel onRingUser={sendRing} />
 
             <div className="rounded-3xl border border-zinc-800 bg-zinc-900/70 p-4">
               <div className="mb-3">
