@@ -295,7 +295,7 @@ export default function RealtimeRoom() {
           reconnect: true,
           maxReconnectAttempts: 10,
           reconnectTimeWait: 1000,
-          ignoreServerUpdates: true,
+          ignoreClusterUpdates: true,
         });
 
         if (cancelled) {
